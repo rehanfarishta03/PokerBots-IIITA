@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 from tournament_utils import (
@@ -73,6 +75,78 @@ def _render_markdown_summary(results: list[dict], invalid_paths: list[str], chan
     return "\n".join(lines)
 
 
+def _find_changed_files_under(changed_files: list[str], protected_path: str) -> list[str]:
+    protected = protected_path.strip("/")
+    if not protected:
+        return []
+    prefix = f"{protected}/"
+    return [path for path in changed_files if path == protected or path.startswith(prefix)]
+
+
+def _materialize_path_from_ref(repo_root: Path, git_ref: str, source_path: str, destination_root: Path) -> tuple[Path | None, str | None]:
+    source = source_path.strip("/")
+    if not source:
+        return None, "Baseline path cannot be empty"
+
+    listed = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", git_ref, "--", source],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode != 0:
+        return None, (listed.stderr or listed.stdout or "Failed to list baseline files").strip()
+
+    tracked_files = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    if not tracked_files:
+        return None, f"Baseline path '{source}' not found at ref '{git_ref}'"
+
+    for rel_path in tracked_files:
+        file_blob = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{git_ref}:{rel_path}"],
+            check=False,
+            capture_output=True,
+        )
+        if file_blob.returncode != 0:
+            stderr_text = file_blob.stderr.decode("utf-8", errors="replace").strip()
+            return None, stderr_text or f"Failed to materialize '{rel_path}' from '{git_ref}'"
+
+        out_path = destination_root / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(file_blob.stdout)
+
+    return (destination_root / source), None
+
+
+def _write_outputs(
+    output_dir: Path,
+    *,
+    args: argparse.Namespace,
+    changed_files: list[str],
+    invalid_paths: list[str],
+    result_rows: list[dict],
+) -> None:
+    summary_md = _render_markdown_summary(result_rows, invalid_paths, changed_files)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "summary.md").write_text(summary_md + "\n", encoding="utf-8")
+    (output_dir / "results.json").write_text(
+        json.dumps(
+            {
+                "base_ref": args.base_ref,
+                "baseline_path": args.baseline_path,
+                "num_rounds": args.num_rounds,
+                "min_submission_bankroll": args.min_submission_bankroll,
+                "changed_files": changed_files,
+                "invalid_paths": invalid_paths,
+                "results": result_rows,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate PR submissions and run baseline qualification")
     parser.add_argument("--repo-root", default=".", help="Path to repository root")
@@ -98,12 +172,46 @@ def main() -> int:
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     changed_files = discover_changed_files(repo_root, args.base_ref)
-    submissions, invalid_paths = parse_changed_submissions(changed_files)
-
     result_rows: list[dict] = []
 
-    baseline_abs = (repo_root / args.baseline_path).resolve()
-    baseline_exists = baseline_abs.is_dir()
+    protected_changes = _find_changed_files_under(changed_files, args.baseline_path)
+    if protected_changes:
+        result_rows.append(
+            {
+                "bot_id": "SECURITY_VULNERABILITY",
+                "submission_path": args.baseline_path,
+                "validation_ok": False,
+                "match_ok": False,
+                "qualified": False,
+                "baseline_bankroll": 0,
+                "submission_bankroll": 0,
+                "issues": [f"Unauthorized modification of protected baseline path: {p}" for p in protected_changes],
+                "log_path": None,
+            }
+        )
+        _write_outputs(
+            output_dir,
+            args=args,
+            changed_files=changed_files,
+            invalid_paths=[],
+            result_rows=result_rows,
+        )
+        return 1
+
+    submissions, invalid_paths = parse_changed_submissions(changed_files)
+
+    trusted_baseline_root = output_dir / "trusted_baseline"
+    if trusted_baseline_root.exists():
+        shutil.rmtree(trusted_baseline_root)
+    trusted_baseline_root.mkdir(parents=True, exist_ok=True)
+
+    baseline_abs, baseline_error = _materialize_path_from_ref(
+        repo_root,
+        args.base_ref,
+        args.baseline_path,
+        trusted_baseline_root,
+    )
+    baseline_exists = baseline_abs is not None and baseline_abs.is_dir()
 
     for submission in submissions:
         row = {
@@ -126,7 +234,9 @@ def main() -> int:
             continue
 
         if not baseline_exists:
-            row["issues"].append(f"Baseline directory not found: {args.baseline_path}")
+            row["issues"].append(
+                baseline_error or f"Baseline directory not found at {args.base_ref}: {args.baseline_path}"
+            )
             result_rows.append(row)
             continue
 
@@ -175,24 +285,12 @@ def main() -> int:
             }
         )
 
-    summary_md = _render_markdown_summary(result_rows, invalid_paths, changed_files)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "summary.md").write_text(summary_md + "\n", encoding="utf-8")
-    (output_dir / "results.json").write_text(
-        json.dumps(
-            {
-                "base_ref": args.base_ref,
-                "baseline_path": args.baseline_path,
-                "num_rounds": args.num_rounds,
-                "min_submission_bankroll": args.min_submission_bankroll,
-                "changed_files": changed_files,
-                "invalid_paths": invalid_paths,
-                "results": result_rows,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_outputs(
+        output_dir,
+        args=args,
+        changed_files=changed_files,
+        invalid_paths=invalid_paths,
+        result_rows=result_rows,
     )
 
     qualified_all = bool(result_rows) and all(row.get("qualified", False) for row in result_rows)
